@@ -111,15 +111,43 @@ def cli_read():
 
 
 # ------------------------------------------------------------------------ PAM
+LOG_FILE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "notelock-debug.log",
+)
+
+
+def log(msg):
+    """Append a line to the debug log (never logs passwords)."""
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%F %T')} {msg}\n")
+    except OSError:
+        pass
+
+
 def check_password(user, password):
+    log(f"check_password: user={user!r} service={PAM_SERVICE!r} len={len(password)}")
     try:
         import pam  # python-pam
-    except ImportError:
+    except ImportError as exc:
+        log(f"IMPORT FAILED: {exc} (install python-pam)")
         print("notelock: python-pam is not installed", file=sys.stderr)
         return False
+    log(f"pam module: {getattr(pam, '__file__', '?')} "
+        f"version={getattr(pam, '__version__', '?')}")
     try:
-        return bool(pam.authenticate(user, password, service=PAM_SERVICE))
+        if hasattr(pam, "pam"):
+            p = pam.pam()
+            ok = bool(p.authenticate(user, password, service=PAM_SERVICE))
+            log(f"authenticate -> {ok} code={p.code} reason={p.reason!r}")
+            return ok
+        ok = bool(pam.authenticate(user, password, service=PAM_SERVICE))
+        log(f"authenticate (module-level) -> {ok}")
+        return ok
     except Exception as exc:  # never crash into an unlocked state
+        log(f"PAM EXCEPTION: {type(exc).__name__}: {exc}")
         print(f"notelock: PAM error: {exc}", file=sys.stderr)
         return False
 
@@ -162,17 +190,28 @@ def run_lock(test_mode):
                 "notelock: the gtk-session-lock library is missing.\n"
                 "Install it (https://github.com/Cu3PO42/gtk-session-lock) and retry."
             )
+        # 1. check the compositor supports ext-session-lock-v1
         if not GtkSessionLock.is_supported():
             sys.exit("notelock: this compositor doesn't support ext-session-lock")
 
-        def lock_gone(*_):
-            # compositor ended the lock (or refused it)
+        # 2. prepare the lock
+        session_lock = GtkSessionLock.prepare_lock()
+
+        # 3. connect to "locked" (required) and "finished"
+        def on_locked(*_):
+            # session is now locked; compositor shows only our surfaces
+            pass
+
+        def on_finished(*_):
+            # the session could not be locked (or the lock was ended): clean up
+            session_lock.destroy()
             Gtk.main_quit()
 
-        session_lock = GtkSessionLock.Instance.new()
-        session_lock.connect("failed", lock_gone)
-        session_lock.connect("finished", lock_gone)
-        session_lock.lock()
+        session_lock.connect("locked", on_locked)
+        session_lock.connect("finished", on_finished)
+
+        # 4. take the lock; surfaces are created and shown right after this
+        session_lock.lock_lock()
 
     user = getpass.getuser()
     session_start = int(time.time())
@@ -218,7 +257,8 @@ def run_lock(test_mode):
         if blank:
             w.get_style_context().add_class("blank")
         if session_lock is not None:
-            session_lock.assign_window_to_monitor(w, display.get_monitor(idx))
+            # 6.2 prepare the (not yet shown) window for this monitor
+            session_lock.new_surface(w, display.get_monitor(idx))
         elif test_mode:
             m = display.get_monitor(idx).get_geometry()
             w.set_default_size(min(m.width, 1100), min(m.height, 800))
@@ -355,8 +395,12 @@ def run_lock(test_mode):
             except OSError:
                 pass
         if session_lock is not None:
-            session_lock.unlock()
-            display.sync()  # make sure the unlock request reaches the compositor
+            # 10. unlock first, 11. then destroy the lock surfaces
+            session_lock.unlock_and_destroy()
+            for win in [main] + blanks:
+                win.destroy()
+            # 12. wait for a Wayland display sync before exiting
+            display.sync()
             display.flush()
         elif not test_mode:
             try:
@@ -414,6 +458,8 @@ def run_lock(test_mode):
     GLib.timeout_add_seconds(1, tick)
     rebuild_notes()
 
+    # 6.3 show every lock window as soon as possible (otherwise the compositor
+    # paints a solid colour on that monitor)
     for b in blanks:
         b.show_all()
     main.show_all()
@@ -450,6 +496,13 @@ def main():
     args = sys.argv[1:]
     if "--read" in args:
         return cli_read()
+    if "--check-pam" in args:
+        user = getpass.getuser()
+        pw = getpass.getpass(f"Password for {user} (service {PAM_SERVICE}): ")
+        ok = check_password(user, pw)
+        print("PASSWORD OK" if ok else "PASSWORD REJECTED")
+        print(f"Details in {LOG_FILE}")
+        return
     if "--clear" in args:
         save_notes([])
         print("Notes cleared.")
